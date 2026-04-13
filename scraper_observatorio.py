@@ -7,7 +7,7 @@ from urllib.parse import urlparse, unquote
 BASE_FOLDER = "Observatorios"
 BASE_URL = "https://iremai.wordpress.com/observatorio-4"
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; IREMAI-Observatorio-Downloader/1.0)"
+    "User-Agent": "Mozilla/5.0 (compatible; IREMAI-Observatorio-Downloader/2.0)"
 }
 
 session = requests.Session()
@@ -27,18 +27,18 @@ def extract_year(text):
 
     text = text.strip()
 
-    m = re.search(r"\(?(\d{2})/(\d{2})/(\d{2})\)?", text)
-    if m:
-        yy = int(m.group(3))
+    # Prioridad 1: años de 4 dígitos
+    years = re.findall(r"\b(20\d{2})\b", text)
+    if years:
+        years = [int(y) for y in years if 2010 <= int(y) <= 2035]
+        if years:
+            return max(years)
+
+    # Prioridad 2: fechas tipo 10/04/26 o (10/04/26)
+    dates = re.findall(r"\(?(\d{2})/(\d{2})/(\d{2})\)?", text)
+    if dates:
+        yy = int(dates[-1][2])
         return 2000 + yy
-
-    m = re.search(r"\b(20\d{2})\b", text)
-    if m:
-        return int(m.group(1))
-
-    m = re.search(r"[Ee]dici[oó]n\s+final.*?\b(20\d{2})\b", text)
-    if m:
-        return int(m.group(1))
 
     return None
 
@@ -65,34 +65,6 @@ def get_filename_from_url(url):
     return safe_filename(filename)
 
 
-def find_post_title(a_tag):
-    candidates = [
-        a_tag.find_parent("article"),
-        a_tag.find_parent(class_=re.compile(r"(post|type-post|hentry|entry)", re.I)),
-        a_tag.find_parent("li"),
-        a_tag.find_parent("div", class_=re.compile(r"(post|entry|archive)", re.I)),
-    ]
-
-    for container in candidates:
-        if not container:
-            continue
-
-        for tag in ["h1", "h2", "h3", "h4"]:
-            title_tag = container.find(tag)
-            if title_tag:
-                text = title_tag.get_text(" ", strip=True)
-                if text:
-                    return text
-
-        title_tag = container.find(class_=re.compile(r"entry-title|post-title|archive-title", re.I))
-        if title_tag:
-            text = title_tag.get_text(" ", strip=True)
-            if text:
-                return text
-
-    return None
-
-
 def download_file(url, destination):
     with session.get(url, stream=True, timeout=90) as r:
         r.raise_for_status()
@@ -106,6 +78,63 @@ def ensure_folder(path):
     os.makedirs(path, exist_ok=True)
 
 
+def possible_post_blocks(soup):
+    blocks = []
+
+    selectors = [
+        "article",
+        "div.post",
+        "div.type-post",
+        "div.hentry",
+        "li",
+    ]
+
+    for sel in selectors:
+        found = soup.select(sel)
+        if found:
+            blocks.extend(found)
+
+    unique = []
+    seen = set()
+    for b in blocks:
+        ident = id(b)
+        if ident not in seen:
+            unique.append(b)
+            seen.add(ident)
+
+    return unique
+
+
+def block_text(block):
+    return block.get_text(" ", strip=True)
+
+
+def block_title(block):
+    for tag in ["h1", "h2", "h3", "h4"]:
+        t = block.find(tag)
+        if t:
+            txt = t.get_text(" ", strip=True)
+            if txt:
+                return txt
+
+    t = block.find(class_=re.compile(r"(entry-title|post-title|archive-title)", re.I))
+    if t:
+        txt = t.get_text(" ", strip=True)
+        if txt:
+            return txt
+
+    return None
+
+
+def collect_pdf_links_from_block(block):
+    links = []
+    for a in block.find_all("a", href=True):
+        href = a["href"].strip()
+        if ".pdf" in href.lower():
+            links.append((href, a.get_text(" ", strip=True)))
+    return links
+
+
 def main():
     ensure_folder(BASE_FOLDER)
     max_page = get_max_page()
@@ -115,7 +144,7 @@ def main():
 
     for page in range(1, max_page + 1):
         url = BASE_URL if page == 1 else f"{BASE_URL}/page/{page}/"
-        print(f"\nProcesando: {url}")
+        print(f"\nProcesando página: {url}")
 
         try:
             r = session.get(url, timeout=30)
@@ -125,45 +154,51 @@ def main():
             continue
 
         soup = BeautifulSoup(r.text, "html.parser")
+        blocks = possible_post_blocks(soup)
 
-        for a in soup.find_all("a", href=True):
-            link = a["href"].strip()
+        print(f"Bloques detectados: {len(blocks)}")
 
-            if ".pdf" not in link.lower():
+        for block in blocks:
+            text_full = block_text(block)
+            title = block_title(block)
+            year = extract_year(text_full) or extract_year(title)
+            pdfs = collect_pdf_links_from_block(block)
+
+            if not pdfs:
                 continue
 
-            if link in seen_links:
-                continue
-            seen_links.add(link)
+            for link, anchor_text in pdfs:
+                if link in seen_links:
+                    continue
+                seen_links.add(link)
 
-            anchor_text = a.get_text(" ", strip=True)
-            post_title = find_post_title(a)
-            filename = get_filename_from_url(link)
+                filename = get_filename_from_url(link)
 
-            year = (
-                extract_year(post_title)
-                or extract_year(anchor_text)
-                or extract_year(filename)
-            )
+                # fallback final si el bloque no trae año
+                final_year = (
+                    year
+                    or extract_year(anchor_text)
+                    or extract_year(filename)
+                )
 
-            folder_name = str(year) if year else "Sin_clasificar"
-            folder = os.path.join(BASE_FOLDER, folder_name)
-            ensure_folder(folder)
+                folder_name = str(final_year) if final_year else "Sin_clasificar"
+                folder = os.path.join(BASE_FOLDER, folder_name)
+                ensure_folder(folder)
 
-            destination = os.path.join(folder, filename)
+                destination = os.path.join(folder, filename)
 
-            if os.path.exists(destination):
-                print(f"Ya existe: {destination}")
-                continue
+                if os.path.exists(destination):
+                    print(f"Ya existe: {destination}")
+                    continue
 
-            try:
-                print(f"Descargando: {filename}")
-                print(f"  título post: {post_title}")
-                print(f"  texto enlace: {anchor_text}")
-                print(f"  carpeta: {folder_name}")
-                download_file(link, destination)
-            except requests.RequestException as e:
-                print(f"Error descargando {link}: {e}")
+                try:
+                    print(f"Descargando: {filename}")
+                    print(f"  título: {title}")
+                    print(f"  año detectado: {final_year}")
+                    print(f"  carpeta: {folder_name}")
+                    download_file(link, destination)
+                except requests.RequestException as e:
+                    print(f"Error descargando {link}: {e}")
 
     print("\nDescarga y organización completadas.")
 
